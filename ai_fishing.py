@@ -19,6 +19,9 @@ Usage:
   python ai_fishing.py --gamepad       Windows only: press R2 on a virtual Xbox pad (needs ViGEmBus + vgamepad)
 
 Hotkeys (live): F8 pause/resume, F9 quit (on a Mac: fn+F8 / fn+F9). Ctrl+C in the terminal also quits.
+
+DISCLAIMER: educational project, not affiliated with Roblox or any game developer. Automation may
+break the rules of Roblox or a game and could get an account warned or banned. Use at your own risk.
 """
 import argparse
 import platform
@@ -553,6 +556,7 @@ def snapshot():
 
 def live(use_gamepad, countdown, dry=False, max_seconds=0):
     print(f"AI Fishing on {platform.system()} {platform.release()}, Python {platform.python_version()}")
+    print("Educational project, use at your own risk: automation may break Roblox or game rules (see README).")
     if IS_MAC and not dry:
         check_mac_permissions()
     flags = {"paused": False, "quit": False}

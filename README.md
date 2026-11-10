@@ -5,7 +5,8 @@ A small Python AI that plays the fishing loop for you: **cast → wait for the b
 It works only by **looking at the screen** (OpenCV colour and shape detection) and **clicking the mouse**, the same way a person would.
 It does not read game memory, inject code or modify the Roblox client.
 
-> Using auto-clickers or macros may go against the rules of Roblox or a particular game. Use it at your own risk.
+> ⚠️ **Educational project. Please read the [Disclaimer](#disclaimer) before using it.**
+> Using auto-clickers, macros or automation may go against the rules of Roblox or a particular game. Use it at your own risk.
 
 **Works on:** Windows 10/11 and macOS 11+ (Intel and Apple Silicon), on any screen:
 1080p laptops, 1440p / 4K monitors, MacBook Retina displays (13", 14", 15", 16"), 16:9, 16:10 and ultrawide,
@@ -125,6 +126,16 @@ The timings were measured from real gameplay and live at the top of each state i
 - the mash click interval `random.uniform(0.045, 0.09)`
 
 The detection areas and colour ranges are constants at the top of `ai_fishing.py`: `STOP_SEARCH`, `CHARGE_X`, `CHARGE_Y`, and the `*_LO` / `*_HI` HSV ranges.
+
+## Disclaimer
+
+This project is for **educational purposes only**, as a way to learn Python and computer vision.
+
+- It is **not affiliated with or endorsed by** Roblox Corporation or the developers of Steal an Egg. All game names, art and trademarks belong to their owners.
+- Using auto-clickers, macros or automation **may go against the [Roblox Terms of Use](https://en.help.roblox.com/hc/en-us/articles/115004647846), the Roblox Community Standards or the rules of a specific game**, and could lead to your account being **warned or banned**.
+- Check the rules of the game you play before using it.
+- If you use this code, you do so **at your own risk**. The author is **not responsible** for any action taken against your account, any loss of in-game items or progress, or any other damage.
+- The software is provided "as is", without warranty of any kind (see the [LICENSE](LICENSE)).
 
 ## License
 
