@@ -1,0 +1,7 @@
+opencv-python>=4.5
+numpy>=1.21
+mss>=6.0
+pynput>=1.7
+pydirectinput>=1.0; sys_platform == "win32"
+pyobjc-framework-Quartz; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices; sys_platform == "darwin"
