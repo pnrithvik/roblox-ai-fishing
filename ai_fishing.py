@@ -28,6 +28,7 @@ import platform
 import random
 import sys
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -40,14 +41,19 @@ def _win_dpi_aware():
     """Use physical pixels on Windows, so window positions, the cursor and screenshots all
     agree on scaled displays (125% / 150% laptops, mixed-DPI multi-monitor setups)."""
     import ctypes
-    for fn in (lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)),  # per-monitor v2
-               lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),                          # Win 8.1+
-               lambda: ctypes.windll.user32.SetProcessDPIAware()):                              # Vista+
+    errors = []
+    for name, fn in (
+            ("per-monitor v2", lambda: bool(ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)))),
+            ("per-monitor", lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0),  # S_OK, Win 8.1+
+            ("system", lambda: bool(ctypes.windll.user32.SetProcessDPIAware()))):           # Vista+
         try:
             if fn():
                 return
-        except Exception:
-            pass
+            errors.append(f"{name}: refused")
+        except Exception as e:  # older Windows without this API: try the next one
+            errors.append(f"{name}: {e}")
+    print(f"  ! could not enable DPI awareness ({'; '.join(errors)}); "
+          "on scaled displays the click area may be slightly off")
 
 
 if IS_WIN:
@@ -150,30 +156,70 @@ class Detector:
 
 
 # ---------------------------------------------------------------- input
+class FailSafeTriggered(Exception):
+    """The mouse was moved into a screen corner: emergency stop."""
+
+
+FAILSAFE_MARGIN = 2  # px from a monitor corner that counts as "in the corner"
+
+
 class MouseInput:
     """Left mouse button at the current cursor position.
-    Windows: pydirectinput (SendInput, which Roblox reliably accepts). macOS/Linux: pynput."""
+    Windows: pydirectinput (SendInput, which Roblox reliably accepts). macOS: pynput.
+    Never use this directly in live mode: always wrap it in CursorGuard."""
 
     def __init__(self):
         self._down = self._up = None
+        self._pdi = None
+        self.held = False
         if IS_WIN:
             try:
                 import pydirectinput
                 pydirectinput.PAUSE = 0
-                pydirectinput.FAILSAFE = False
+                pydirectinput.FAILSAFE = True  # mouse into a screen corner = emergency stop
+                self._pdi = pydirectinput
                 self._down, self._up = pydirectinput.mouseDown, pydirectinput.mouseUp
             except ImportError:
-                pass
+                print("  ! pydirectinput is not installed - using pynput for clicks instead")
         if self._down is None:
             from pynput.mouse import Button, Controller
             m = Controller()
             self._down, self._up = (lambda: m.press(Button.left)), (lambda: m.release(Button.left))
 
-    def down(self): self._down()
-    def up(self): self._up()
+    def down(self):
+        self.held = True  # set first, so a failure half-way through still gets released
+        try:
+            self._down()
+        except Exception as e:
+            if type(e).__name__ == "FailSafeException":
+                raise FailSafeTriggered("mouse moved into a screen corner") from e
+            raise
+
+    def up(self):
+        """Release the button if we are holding it."""
+        if self.held:
+            self.release_all()
+
+    def release_all(self):
+        """Always send a release, even with the cursor in a fail-safe corner
+        (pydirectinput would otherwise refuse and leave the button stuck down)."""
+        pdi = self._pdi
+        old = pdi.FAILSAFE if pdi else None
+        try:
+            if pdi:
+                pdi.FAILSAFE = False
+            self._up()
+        finally:
+            if pdi:
+                pdi.FAILSAFE = old
+            self.held = False
 
     def click(self):
-        self._down(); time.sleep(random.uniform(0.012, 0.03)); self._up()
+        self.down()
+        try:
+            time.sleep(random.uniform(0.012, 0.03))
+        finally:
+            self.up()
 
 
 class GamepadInput:
@@ -185,68 +231,170 @@ class GamepadInput:
         except ImportError:
             sys.exit("--gamepad needs:  pip install vgamepad   (and the ViGEmBus driver)")
         self.pad = vg.VX360Gamepad()
+        self.held = False
 
     def _trig(self, v):
         self.pad.right_trigger(value=v); self.pad.update()
 
-    def down(self): self._trig(255)
-    def up(self): self._trig(0)
+    def down(self):
+        self.held = True
+        self._trig(255)
+
+    def up(self):
+        if self.held:
+            self.release_all()
+
+    def release_all(self):
+        try:
+            self._trig(0)
+        finally:
+            self.held = False
 
     def click(self):
-        self._trig(255); time.sleep(random.uniform(0.015, 0.035)); self._trig(0)
+        self.down()
+        try:
+            time.sleep(random.uniform(0.015, 0.035))
+        finally:
+            self.up()
+
+
+_cursor_warned = False
 
 
 def cursor_pos():
     """Mouse position in the same coordinate space as the screen capture."""
+    global _cursor_warned
     if IS_WIN:
         import ctypes
         import ctypes.wintypes as wt
         p = wt.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(p)):
+            raise OSError("GetCursorPos failed")
         return p.x, p.y
     if IS_MAC:
         try:
             import Quartz
             loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
             return int(loc.x), int(loc.y)
-        except Exception:
-            pass
+        except Exception as e:
+            if not _cursor_warned:
+                print(f"  ! Quartz cursor lookup failed ({e}); using pynput instead")
+                _cursor_warned = True
     from pynput.mouse import Controller
     x, y = Controller().position
     return int(x), int(y)
 
 
-class CursorGuard:
-    """Only lets presses through while the mouse cursor is over the captured game area,
-    so clicks never land in another window (editor, browser, ...)."""
+def in_failsafe_corner(x, y, monitors):
+    """True if (x, y) is in a corner of any monitor."""
+    m = FAILSAFE_MARGIN
+    for mon in monitors:
+        l, t = mon["left"], mon["top"]
+        r, b = l + mon["width"] - 1, t + mon["height"] - 1
+        if (abs(x - l) <= m or abs(x - r) <= m) and (abs(y - t) <= m or abs(y - b) <= m):
+            return True
+    return False
 
-    def __init__(self, inp, grabber):
-        self.inp, self.g, self.warned = inp, grabber, False
+
+class CursorGuard:
+    """The single safety gate for every automated press. Before EACH press/click it checks,
+    freshly, that:
+      1. the Roblox window is positively identified (exists, visible, not minimised),
+      2. Roblox is the foreground (active) window,
+      3. the mouse cursor is inside the Roblox window,
+      4. the cursor is not in a screen corner (fail-safe: raises FailSafeTriggered).
+    If any check fails, nothing is sent, and a held button is released."""
+
+    def __init__(self, inp, grabber, log=print):
+        self.inp, self.g, self.log = inp, grabber, log
+        self.last_reason = None
+
+    @property
+    def held(self):
+        return getattr(self.inp, "held", False)
+
+    def check(self):
+        """(ok, reason). Raises FailSafeTriggered if the cursor is in a screen corner."""
+        try:
+            x, y = cursor_pos()
+        except Exception as e:
+            return False, f"cannot read the mouse position ({e})"
+        if in_failsafe_corner(x, y, self.g.monitors()):
+            raise FailSafeTriggered("mouse moved into a screen corner")
+        win = self.g.find_window()
+        if not win:
+            return False, "Roblox window not found (open it and don't minimise it)"
+        try:
+            front = is_foreground(win)
+        except Exception as e:
+            return False, f"cannot check the active window ({e})"
+        if not front:
+            return False, "Roblox is not the active window (click into the game)"
+        a = win["area"]
+        if not (a["left"] <= x < a["left"] + a["width"] and a["top"] <= y < a["top"] + a["height"]):
+            return False, "the cursor is not over the Roblox window"
+        return True, ""
 
     def _ok(self):
-        x, y = cursor_pos()
-        a = self.g.area
-        inside = bool(a) and a["left"] <= x < a["left"] + a["width"] and a["top"] <= y < a["top"] + a["height"]
-        if not inside and not self.warned:
-            print("  ! cursor is not over the game window - not clicking until it is")
-        self.warned = not inside
-        return inside
+        ok, why = self.check()
+        if not ok and why != self.last_reason:
+            self.log(f"  ! not clicking: {why}")
+        elif ok and self.last_reason:
+            self.log("  clicking enabled again")
+        self.last_reason = None if ok else why
+        return ok
 
     def down(self):
-        if self._ok(): self.inp.down()
+        if self._ok():
+            self.inp.down()
 
-    def up(self): self.inp.up()  # always allowed, so a hold is never left stuck
+    def up(self):
+        self.inp.up()  # always allowed, so a hold is never left stuck
+
+    def release_all(self):
+        self.inp.release_all()
 
     def click(self):
-        if self._ok(): self.inp.click()
+        if self._ok():
+            self.inp.click()
+
+    def watchdog(self):
+        """Called every frame: fail-safe corner check, and if a button is held while it is
+        no longer safe, let go."""
+        try:
+            x, y = cursor_pos()
+        except Exception:
+            x = y = None
+        if x is not None and in_failsafe_corner(x, y, self.g.monitors()):
+            raise FailSafeTriggered("mouse moved into a screen corner")
+        if self.held and not self._ok():
+            self.inp.up()
 
 
 class LogInput:
-    """Dry-run input: records actions instead of sending them."""
-    def __init__(self): self.events = []; self.t = 0.0; self.clicks = 0
-    def down(self): self.events.append((self.t, "PRESS (hold)"))
-    def up(self): self.events.append((self.t, "RELEASE"))
-    def click(self): self.clicks += 1
+    """Dry-run input: records/logs what would happen, never sends any real input."""
+
+    def __init__(self, log=None):
+        self.events = []; self.t = 0.0; self.clicks = 0; self.held = False; self.log = log
+
+    def down(self):
+        self.events.append((self.t, "PRESS (hold)")); self.held = True
+        if self.log:
+            self.log("  [dry] would PRESS and hold the mouse button")
+
+    def up(self):
+        self.events.append((self.t, "RELEASE"))
+        if self.held and self.log:
+            self.log("  [dry] would RELEASE the mouse button")
+        self.held = False
+
+    def release_all(self):
+        self.up()
+
+    def click(self):
+        self.clicks += 1
+        if self.log and self.clicks % 10 == 1:
+            self.log(f"  [dry] would click ({self.clicks} clicks so far)")
 
 
 # ---------------------------------------------------------------- state machine
@@ -389,8 +537,13 @@ class Bot:
 
 
 # ---------------------------------------------------------------- screen capture
+class CaptureError(Exception):
+    """The game could not be captured (window missing, capture failed, invalid frame)."""
+
+
 def _find_roblox_windows():
-    """Client area of the Roblox game window, or None. Windows: physical pixels."""
+    """The visible, non-minimised Roblox game window: {"area": client area, "hwnd": handle},
+    or None. Windows: physical pixels."""
     import ctypes
     import ctypes.wintypes as wt
     u = ctypes.windll.user32
@@ -408,71 +561,120 @@ def _find_roblox_windows():
                     u.GetClientRect(hwnd, ctypes.byref(r))
                     u.ClientToScreen(hwnd, ctypes.byref(p))
                     if r.right > 200 and r.bottom > 200:
-                        found.append({"left": p.x, "top": p.y, "width": r.right, "height": r.bottom})
+                        found.append({"area": {"left": p.x, "top": p.y, "width": r.right, "height": r.bottom},
+                                      "hwnd": hwnd})
         return True
 
     u.EnumWindows(each, 0)
-    return max(found, key=lambda a: a["width"] * a["height"]) if found else None
+    return max(found, key=lambda w: w["area"]["width"] * w["area"]["height"]) if found else None
 
 
 def _find_roblox_mac(monitors):
-    """Roblox window on macOS, in points (the same space mss uses), without the title bar."""
+    """The Roblox window on macOS: {"area": in points (the same space mss uses) without the
+    title bar, "front": True if Roblox is the frontmost app}, or None."""
     import Quartz
     opts = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
-    best = None
-    for w in Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID) or []:
-        owner = str(w.get(Quartz.kCGWindowOwnerName, "") or "").lower()
-        if not owner.startswith("roblox") or "studio" in owner or w.get(Quartz.kCGWindowLayer, 0) != 0:
+    best, front_owner = None, None
+    for w in Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID) or []:  # front to back
+        if w.get(Quartz.kCGWindowLayer, 0) != 0:
             continue
+        owner = str(w.get(Quartz.kCGWindowOwnerName, "") or "").lower()
         b = w.get(Quartz.kCGWindowBounds) or {}
         a = {"left": int(b.get("X", 0)), "top": int(b.get("Y", 0)),
              "width": int(b.get("Width", 0)), "height": int(b.get("Height", 0))}
+        if front_owner is None and a["width"] > 50 and a["height"] > 50:
+            front_owner = owner  # first normal window = the frontmost application
+        if not owner.startswith("roblox") or "studio" in owner:
+            continue
         if a["width"] > 200 and a["height"] > 200 and (best is None or a["width"] * a["height"] > best["width"] * best["height"]):
             best = a
-    if best:
-        fullscreen = any(m["left"] == best["left"] and m["top"] == best["top"] and m["width"] == best["width"]
-                         and m["height"] == best["height"] for m in monitors[1:])
-        if not fullscreen and best["height"] > 300:  # windowed: skip the ~28 pt title bar
-            best["top"] += 28
-            best["height"] -= 28
-    return best
+    if not best:
+        return None
+    fullscreen = any(m["left"] == best["left"] and m["top"] == best["top"] and m["width"] == best["width"]
+                     and m["height"] == best["height"] for m in monitors[1:])
+    if not fullscreen and best["height"] > 300:  # windowed: skip the ~28 pt title bar
+        best["top"] += 28
+        best["height"] -= 28
+    front = bool(front_owner) and front_owner.startswith("roblox") and "studio" not in front_owner
+    return {"area": best, "front": front}
+
+
+def find_roblox_window(monitors):
+    """The positively identified Roblox window, or None. On other systems there is no reliable
+    window lookup, so this returns None and automated input stays disabled (fail closed)."""
+    if IS_WIN:
+        return _find_roblox_windows()
+    if IS_MAC:
+        return _find_roblox_mac(monitors)
+    return None
+
+
+def is_foreground(win):
+    """True if the Roblox window is the active (foreground) window."""
+    if IS_WIN:
+        import ctypes
+        import ctypes.wintypes as wt
+        u = ctypes.windll.user32
+        u.GetForegroundWindow.restype = wt.HWND
+        u.GetAncestor.restype = wt.HWND
+        u.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+        fg = u.GetForegroundWindow()
+        if not fg:
+            return False
+        return fg == win["hwnd"] or u.GetAncestor(fg, 2) == win["hwnd"]  # 2 = GA_ROOT
+    if IS_MAC:
+        return bool(win.get("front"))
+    return False
 
 
 class GameGrabber:
     """Captures the Roblox game area on whichever monitor it is on (follows it if it moves).
-    Falls back to the monitor under the mouse cursor if the window can't be found."""
+    allow_fallback=True (only for --dry and --snapshot, which never click) captures the monitor
+    under the cursor when Roblox isn't found; otherwise a missing window is a CaptureError."""
 
-    def __init__(self, log=print):
+    def __init__(self, log=print, allow_fallback=False):
         import mss
         self.log = log
+        self.allow_fallback = allow_fallback
         self.sct = (getattr(mss, "MSS", None) or mss.mss)()
         self.area, self.t_area, self.desc = None, 0.0, None
-        self.find_failed = False
+        self.lookup_error = None
 
-    def _find_window(self):
+    def monitors(self):
+        return self.sct.monitors[1:]
+
+    def find_window(self):
+        """Fresh lookup of the Roblox window (or None). Lookup errors are reported, not hidden."""
         try:
-            if IS_WIN:
-                return _find_roblox_windows()
-            if IS_MAC:
-                return _find_roblox_mac(self.sct.monitors)
-        except Exception as e:  # e.g. pyobjc missing - fall back to monitor capture
-            if not self.find_failed:
-                self.log(f"  (window lookup unavailable: {e})")
-                self.find_failed = True
-        return None
+            win = find_roblox_window(self.sct.monitors)
+        except Exception as e:  # e.g. pyobjc missing: report it; input stays disabled
+            msg = f"{type(e).__name__}: {e}"
+            if msg != self.lookup_error:
+                self.log(f"  ! Roblox window lookup failed ({msg}) - automated clicking is disabled")
+                self.lookup_error = msg
+            return None
+        self.lookup_error = None
+        return win
 
     def _find_area(self):
-        a = self._find_window()
-        if a:
+        win = self.find_window()
+        if win:
+            a = win["area"]
             v = self.sct.monitors[0]  # bounding box of all monitors: clip off-screen parts
             l, t = max(a["left"], v["left"]), max(a["top"], v["top"])
             r = min(a["left"] + a["width"], v["left"] + v["width"])
             b = min(a["top"] + a["height"], v["top"] + v["height"])
             if r - l > 200 and b - t > 200:
                 return {"left": l, "top": t, "width": r - l, "height": b - t}, "Roblox window"
-        x, y = cursor_pos()
-        for m in self.sct.monitors[1:]:
-            if m["left"] <= x < m["left"] + m["width"] and m["top"] <= y < m["top"] + m["height"]:
+        if not self.allow_fallback:
+            return None, "Roblox window not found (open Roblox and don't minimise it)"
+        try:
+            x, y = cursor_pos()
+        except Exception as e:
+            self.log(f"  ! cannot read the mouse position ({e}); using the primary monitor")
+            x, y = None, None
+        for m in self.monitors():
+            if x is not None and m["left"] <= x < m["left"] + m["width"] and m["top"] <= y < m["top"] + m["height"]:
                 return dict(m), "monitor under the cursor (Roblox window not found)"
         return dict(self.sct.monitors[1]), "primary monitor (Roblox window not found)"
 
@@ -484,13 +686,23 @@ class GameGrabber:
             self.area, self.desc, self.t_area = area, desc, now
         else:
             changed = False
-        img = np.asarray(self.sct.grab(self.area))
+        if self.area is None:
+            self.t_area = 0.0  # look again next time
+            raise CaptureError(self.desc)
+        try:
+            img = np.asarray(self.sct.grab(self.area))
+        except Exception as e:
+            self.area = None  # re-locate the window on the next attempt
+            raise CaptureError(f"screen capture failed ({type(e).__name__}: {e})") from e
+        if img.ndim != 3 or img.shape[2] not in (3, 4) or img.shape[0] < 50 or img.shape[1] < 50:
+            self.area = None
+            raise CaptureError(f"invalid frame from screen capture (shape {img.shape})")
         if changed:
             scale = img.shape[1] / self.area["width"]
             extra = f", {img.shape[1]}x{img.shape[0]} px ({scale:g}x HiDPI/Retina)" if abs(scale - 1) > 0.01 else ""
             self.log(f"capturing {self.desc}: {self.area['width']}x{self.area['height']} "
                      f"at ({self.area['left']},{self.area['top']}){extra}")
-        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR if img.shape[2] == 4 else cv2.COLOR_RGB2BGR)
 
 
 # ---------------------------------------------------------------- permissions (macOS)
@@ -505,16 +717,16 @@ def check_mac_permissions():
             print("! Screen Recording permission is missing. Enable it for your terminal app in\n"
                   "  System Settings > Privacy & Security > Screen Recording, then restart the terminal.")
             ok = False
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"! Could not check the Screen Recording permission ({e}).")
     try:
         from ApplicationServices import AXIsProcessTrusted
         if not AXIsProcessTrusted():
             print("! Accessibility permission is missing (needed to click and for F8/F9). Enable it for your\n"
                   "  terminal app in System Settings > Privacy & Security > Accessibility, then restart the terminal.")
             ok = False
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"! Could not check the Accessibility permission ({e}).")
     return ok
 
 
@@ -532,6 +744,10 @@ def simulate(path):
         ok, f = cap.read()
         if not ok:
             break
+        if f is None or f.size == 0:
+            print(f"  ! skipping invalid frame {i}")
+            i += 1
+            continue
         t = i / fps
         inp.t = t
         bot.tick(det.analyze(f), t)
@@ -544,14 +760,91 @@ def simulate(path):
 
 
 def snapshot():
-    img = GameGrabber()()
+    try:
+        img = GameGrabber(allow_fallback=True)()
+    except CaptureError as e:
+        sys.exit(f"ERROR: {e}")
     d = Detector().analyze(img)
     h, w = img.shape[:2]
     lw = max(2, h // 300)
     for (x0, x1, y0, y1), c in [(stop_box(w, h), (0, 0, 255)), (charge_box(w, h), (255, 255, 0))]:
         cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), c, lw)
-    cv2.imwrite("snapshot.png", img)
+    if not cv2.imwrite("snapshot.png", img):
+        sys.exit("ERROR: could not write snapshot.png (is the folder writable?)")
     print("saved snapshot.png", d)
+
+
+def make_hotkey_handler(flags, keyboard, log=print):
+    """F8 toggles pause, F9 quits."""
+    def on_key(k):
+        if k == keyboard.Key.f8:
+            flags["paused"] = not flags["paused"]
+            log("PAUSED" if flags["paused"] else "RESUMED")
+        elif k == keyboard.Key.f9:
+            flags["quit"] = True
+            log("F9 pressed - stopping")
+            return False
+    return on_key
+
+
+MAX_CAPTURE_FAILURES = 60  # consecutive failures (~2 minutes with back-off) before giving up
+
+
+def run_loop(bot, grab, det, inp, flags, max_seconds=0, log=print, sleep=time.sleep, clock=time.monotonic):
+    """Main loop. Returns an exit code (0 = normal stop). The mouse button is always released."""
+    t0 = clock()
+    frames, t_fps, failures = 0, clock(), 0
+    code = 0
+    try:
+        while not flags["quit"]:
+            t_loop = clock()
+            if max_seconds and t_loop - t0 > max_seconds:
+                break
+            if flags["paused"]:
+                inp.up(); bot.state = "START"; sleep(0.1); continue
+            try:
+                frame = grab()
+            except CaptureError as e:
+                failures += 1
+                inp.up()  # never keep holding while blind
+                bot.state = "START"
+                if failures == 1 or failures % 10 == 0:
+                    log(f"  ! {e} - retrying (attempt {failures}/{MAX_CAPTURE_FAILURES})")
+                if failures >= MAX_CAPTURE_FAILURES:
+                    log("ERROR: the game could not be captured for too long - stopping.")
+                    code = 1
+                    break
+                sleep(min(0.25 * failures, 2.0))  # back off instead of spinning
+                continue
+            if failures:
+                log("  capture working again")
+                failures = 0
+            if hasattr(inp, "watchdog"):
+                inp.watchdog()
+            bot.tick(det.analyze(frame), clock() - t0)
+            frames += 1
+            if clock() - t_fps > 10:
+                fps = frames / (clock() - t_fps)
+                slow = "  <- slow; close other apps or make the Roblox window smaller" if fps < 6 else ""
+                log(f"  (loop {fps:.0f} fps, state {bot.state}){slow}")
+                frames, t_fps = 0, clock()
+            # ~30 checks per second is plenty; don't burn a whole CPU core on fast PCs
+            sleep(max(0.0, 1 / 30 - (clock() - t_loop)))
+    except KeyboardInterrupt:
+        log("Ctrl+C - stopping")
+    except FailSafeTriggered:
+        log("FAIL-SAFE: the mouse was moved into a screen corner - emergency stop")
+    except Exception as e:
+        log(f"ERROR: unexpected {type(e).__name__}: {e}")
+        traceback.print_exc()
+        code = 1
+    finally:
+        try:
+            inp.release_all()  # never leave the mouse button held down
+        except Exception as e:
+            log(f"ERROR: could not release the mouse button ({e}) - click once manually to release it")
+            code = 1
+    return code
 
 
 def live(use_gamepad, countdown, dry=False, max_seconds=0):
@@ -559,57 +852,41 @@ def live(use_gamepad, countdown, dry=False, max_seconds=0):
     print("Educational project, use at your own risk: automation may break Roblox or game rules (see README).")
     if IS_MAC and not dry:
         check_mac_permissions()
+    if not dry and not (IS_WIN or IS_MAC):
+        sys.exit("Live mode needs Windows or macOS (Roblox window detection). Use --dry to test the detector.")
     flags = {"paused": False, "quit": False}
     try:
         from pynput import keyboard
-
-        def on_key(k):
-            if k == keyboard.Key.f8:
-                flags["paused"] = not flags["paused"]
-                print("PAUSED" if flags["paused"] else "RESUMED")
-            elif k == keyboard.Key.f9:
-                flags["quit"] = True
-                return False
-        keyboard.Listener(on_press=on_key).start()
+        keyboard.Listener(on_press=make_hotkey_handler(flags, keyboard)).start()
         hot = "F8 = pause/resume, F9 = quit" + (" (fn+F8 / fn+F9 on a Mac)" if IS_MAC else "") + ", or Ctrl+C here"
     except Exception as e:
         hot = f"hotkeys unavailable ({e}); press Ctrl+C in this window to quit"
 
-    inp = LogInput() if dry else GamepadInput() if use_gamepad else MouseInput()
     if dry:
+        inp = LogInput(log=print)
         print("DRY RUN: reading the screen and logging decisions, no clicks sent.")
-    grab, det = GameGrabber(), Detector()
-    grab()  # log what will be captured
-    if grab.desc != "Roblox window":
-        print("! Roblox window not found. Open Roblox (not minimised); until then the monitor under the cursor is used.")
+    else:
+        inp = GamepadInput() if use_gamepad else MouseInput()
+    grab, det = GameGrabber(allow_fallback=dry), Detector()
+    try:
+        grab()  # log what will be captured
+    except CaptureError as e:
+        print(f"! {e}. Waiting for it...")
     if not dry:
         inp = CursorGuard(inp, grab)
+        print("Clicks are only sent while Roblox is the active window and the cursor is over it.")
+        print("Emergency stop: move the mouse into any screen corner.")
     print(f"Starting in {countdown:g}s - click into the game window and leave the cursor over it.")
     print(hot)
-    time.sleep(countdown)
-    bot, t0 = Bot(inp), time.monotonic()
-    frames, t_fps = 0, time.monotonic()
     try:
-        while not flags["quit"]:
-            t_loop = time.monotonic()
-            if max_seconds and t_loop - t0 > max_seconds:
-                break
-            if flags["paused"]:
-                inp.up(); bot.state = "START"; time.sleep(0.1); continue
-            bot.tick(det.analyze(grab()), time.monotonic() - t0)
-            frames += 1
-            if time.monotonic() - t_fps > 10:
-                fps = frames / (time.monotonic() - t_fps)
-                slow = "  <- slow; close other apps or make the Roblox window smaller" if fps < 6 else ""
-                print(f"  (loop {fps:.0f} fps, state {bot.state}){slow}")
-                frames, t_fps = 0, time.monotonic()
-            # ~30 checks per second is plenty; don't burn a whole CPU core on fast PCs
-            time.sleep(max(0.0, 1 / 30 - (time.monotonic() - t_loop)))
+        time.sleep(countdown)
     except KeyboardInterrupt:
-        pass
-    finally:
-        inp.up()  # never leave the mouse button held down
+        print("cancelled")
+        return 0
+    bot = Bot(inp)
+    code = run_loop(bot, grab, det, inp, flags, max_seconds)
     print(f"stopped: casts {bot.casts}, catches {bot.catches}, perfect releases {bot.perfect_releases}")
+    return code
 
 
 if __name__ == "__main__":
@@ -626,4 +903,4 @@ if __name__ == "__main__":
     elif a.snapshot:
         snapshot()
     else:
-        live(a.gamepad, a.countdown, a.dry, a.seconds)
+        sys.exit(live(a.gamepad, a.countdown, a.dry, a.seconds))

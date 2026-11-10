@@ -1,7 +1,26 @@
+# virtual environments
 .venv/
 venv/
+env/
+# secrets / local config
+.env
+.env.*
+# Python caches and build output
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# logs, screenshots and recordings (may show your screen/username)
+*.log
+logs/
 snapshot.png
 *.mp4
+*.mov
+*.mkv
+*.avi
+recordings/
+# OS / editor files
 .DS_Store
+Thumbs.db

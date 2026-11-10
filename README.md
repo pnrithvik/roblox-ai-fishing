@@ -8,13 +8,13 @@ It does not read game memory, inject code or modify the Roblox client.
 > ⚠️ **Educational project. Please read the [Disclaimer](#disclaimer) before using it.**
 > Using auto-clickers, macros or automation may go against the rules of Roblox or a particular game. Use it at your own risk.
 
-**Works on:** Windows 10/11 and macOS 11+ (Intel and Apple Silicon), on any screen:
+**Works on:** Windows 10/11 and macOS 13+ (Apple Silicon) / macOS 14+ (Intel), with Python 3.12 or newer, on any screen:
 1080p laptops, 1440p / 4K monitors, MacBook Retina displays (13", 14", 15", 16"), 16:9, 16:10 and ultrawide,
 with any Windows display scaling (100%, 125%, 150%…), and with Roblox on any monitor, full-screen or windowed.
 
 ## Quick start
 
-1. Install **Python 3.9 or newer** from [python.org](https://www.python.org/downloads/).
+1. Install **Python 3.12 or newer** from [python.org](https://www.python.org/downloads/).
    On Windows, tick **"Add python.exe to PATH"** in the installer.
 2. Download this repo: the green **Code** button → **Download ZIP**, then unzip it.
    You can also use `git clone`.
@@ -100,16 +100,36 @@ In every setup it caught every fish, never falsely detected the mash bar, and re
 
 ### Safety
 
-- Never clicks unless the mouse cursor is over the Roblox window.
-- Releases the mouse button whenever it pauses, quits or crashes, so the mouse is never left held down.
+Before **every** click, it checks again that all of these are true. If any check fails, nothing is sent and a held button is let go.
+
+1. The Roblox window is positively identified: it exists, is visible and is not minimised.
+2. Roblox is the **active (foreground) window**.
+3. The mouse cursor is **inside** the Roblox window.
+
+More safety features:
+
+- **No Roblox window, no clicks.** If the window can't be found, all automated input is disabled. It never falls back to clicking on a whole monitor. Only `--dry` and `--snapshot`, which never click, may watch the monitor under the cursor.
+- **Emergency stop:** move the mouse into **any screen corner** to stop immediately. The mouse button is released even then.
+- The mouse button is always released when it pauses, quits, hits an error or is stopped with Ctrl+C.
+- **Screen-capture problems** are retried with a growing delay. After about 2 minutes without a usable frame, it stops with a clear error instead of looping forever.
 - If it casts 3 times without seeing the charge meter, it prints a warning and slows down instead of spamming.
+- `--dry` never sends any real mouse or keyboard input. It only logs what it *would* do.
+- No network access, no telemetry, and it never reads game memory.
+
+### Tests
+
+The safety features are covered by automated tests. All input and screen capture are mocked, so the tests never click:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `Roblox window not found` | Open Roblox and don't minimise it. Until it finds the window, it watches the monitor under your mouse. |
-| `cursor is not over the game window` | Move the mouse over the game. For safety it only clicks inside Roblox. |
+| `Roblox window not found` | Open Roblox and don't minimise it. Clicking stays disabled until the window is found. |
+| `not clicking: ...` | It says why: Roblox not found, not the active window, or the cursor isn't over it. Click into the game and leave the mouse there. |
 | `WARNING: 3 casts in a row with no CHARGE meter` | Equip the rod, close any open menus and make sure nothing covers the game window. |
 | Mac: it sees only the desktop / never clicks | Grant **Screen Recording** and **Accessibility** (see above), then restart the terminal. |
 | Windows: clicks do nothing | Run the terminal as the same user as Roblox. If Roblox runs as administrator, run the terminal as administrator too. |
